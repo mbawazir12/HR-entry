@@ -96,9 +96,17 @@ app.post('/upload', withLogto(logtoConfig), requireAuth, upload.single('file'), 
     form.append('uploadedAt', new Date().toISOString());
     // --------------------------------------------------------------------
 
+    // Logto's client stashed the ID token in the session at sign-in; forward
+    // it so n8n can verify the user identity against Logto's JWKS instead of
+    // trusting the uploadedBy string.
+    const idToken = req.session?.idToken;
+
     const r = await fetch(N8N_WEBHOOK_URL, {
       method: 'POST',
-      headers: { 'x-edge-secret': EDGE_SHARED_SECRET }, // proves it came from us
+      headers: {
+        'x-edge-secret': EDGE_SHARED_SECRET, // proves the call came from us
+        ...(idToken && { Authorization: `Bearer ${idToken}` }),
+      },
       body: form,
     });
 
