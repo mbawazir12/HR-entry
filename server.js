@@ -1,9 +1,7 @@
 import express from 'express';
-import session from 'express-session';
+import cookieSession from 'cookie-session';
 import multer from 'multer';
 import { handleAuthRoutes, withLogto } from '@logto/express';
-import { createClient } from 'redis';
-import RedisStore from 'connect-redis';
 
 const {
   LOGTO_ENDPOINT,
@@ -14,7 +12,6 @@ const {
   N8N_WEBHOOK_URL,
   EDGE_SHARED_SECRET,
   NODE_ENV,
-  REDIS_URL,
   PORT = 3000,
 } = process.env;
 
@@ -31,31 +28,18 @@ const app = express();
 // Vercel (and most hosts) sit behind a proxy; required for Secure cookies.
 app.set('trust proxy', 1);
 
-// Serverless functions are stateless — MemoryStore drops sessions between
-// invocations, which breaks Logto's sign-in callback. Use Redis when REDIS_URL
-// is present, and fall back to MemoryStore for local dev.
-let sessionStore;
-if (REDIS_URL) {
-  const redisClient = createClient({ url: REDIS_URL });
-  redisClient.on('error', (err) => console.error('Redis error:', err));
-  // Fire-and-forget; connect-redis queues commands until connected.
-  redisClient.connect().catch((err) => console.error('Redis connect failed:', err));
-  sessionStore = new RedisStore({ client: redisClient, prefix: 'hr:sess:' });
-} else {
-  console.warn('REDIS_URL not set — using in-memory session store (dev only).');
-}
-
+// cookie-session stores the session payload in a signed cookie itself, so no
+// server-side store is needed — a good fit for Vercel's stateless functions.
+// Logto's express storage only reads/writes string keys on req.session, so it
+// works transparently with this middleware.
 app.use(
-  session({
-    store: sessionStore,
-    secret: COOKIE_SECRET,
-    resave: false,
-    saveUninitialized: false,
-    cookie: {
-      maxAge: 14 * 24 * 60 * 60 * 1000,
-      secure: NODE_ENV === 'production',
-      sameSite: 'lax',
-    },
+  cookieSession({
+    name: 'session',
+    keys: [COOKIE_SECRET],
+    maxAge: 14 * 24 * 60 * 60 * 1000,
+    httpOnly: true,
+    secure: NODE_ENV === 'production',
+    sameSite: 'lax',
   })
 );
 
