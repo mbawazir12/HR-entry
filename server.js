@@ -7,6 +7,19 @@ import { handleAuthRoutes, withLogto } from '@logto/express';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
+// Base64url-decode a JWT's payload segment for logging. No signature check —
+// verification is n8n's job.
+const decodeJwtPayload = (jwt) => {
+  try {
+    const [, payload] = jwt.split('.');
+    if (!payload) return null;
+    const json = Buffer.from(payload, 'base64url').toString('utf8');
+    return JSON.parse(json);
+  } catch {
+    return null;
+  }
+};
+
 const {
   LOGTO_ENDPOINT,
   LOGTO_APP_ID,
@@ -100,6 +113,15 @@ app.post('/upload', withLogto(logtoConfig), requireAuth, upload.single('file'), 
     // it so n8n can verify the user identity against Logto's JWKS instead of
     // trusting the uploadedBy string.
     const idToken = req.session?.idToken;
+    const claims = idToken ? decodeJwtPayload(idToken) : null;
+    console.log('[upload] forwarding to n8n', {
+      hasIdToken: Boolean(idToken),
+      iss: claims?.iss,
+      aud: claims?.aud,
+      sub: claims?.sub,
+      exp: claims?.exp,
+      expiresInSec: claims?.exp ? claims.exp - Math.floor(Date.now() / 1000) : null,
+    });
 
     const r = await fetch(N8N_WEBHOOK_URL, {
       method: 'POST',
@@ -112,7 +134,12 @@ app.post('/upload', withLogto(logtoConfig), requireAuth, upload.single('file'), 
 
     if (!r.ok) {
       const detail = await r.text();
-      return res.status(502).json({ error: 'ingest_failed', detail });
+      console.error('[upload] n8n rejected:', r.status, detail);
+      return res.status(502).json({
+        error: 'ingest_failed',
+        upstreamStatus: r.status,
+        detail,
+      });
     }
 
     const data = await r.json().catch(() => ({}));

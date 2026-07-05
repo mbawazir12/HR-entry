@@ -191,7 +191,8 @@
         } else if (res.status === 403) {
           setStatus('err', 'You are not authorized to upload.');
         } else if (res.status === 502) {
-          setStatus('warn', 'Auth succeeded, but the ingest pipeline is not reachable yet (502). This is expected until the n8n webhook is live.');
+          const upstream = body.upstreamStatus ? ' (upstream ' + body.upstreamStatus + ')' : '';
+          setStatus('warn', 'Ingest failed' + upstream + ':\n' + (body.detail || JSON.stringify(body)));
         } else {
           setStatus('err', 'Upload failed (' + res.status + ').\n' + (body.detail || body.error || JSON.stringify(body)));
         }
