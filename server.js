@@ -1,7 +1,11 @@
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import express from 'express';
 import cookieSession from 'cookie-session';
 import multer from 'multer';
 import { handleAuthRoutes, withLogto } from '@logto/express';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const {
   LOGTO_ENDPOINT,
@@ -48,7 +52,7 @@ app.use(handleAuthRoutes(logtoConfig));
 
 // Serve the frontend from the same origin (Phase 4 drops files in ./public).
 // Same-origin keeps the session cookie simple — no CORS credential dance.
-app.use(express.static('public'));
+app.use(express.static(path.join(__dirname, 'public')));
 
 const upload = multer({
   storage: multer.memoryStorage(),
