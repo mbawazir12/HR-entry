@@ -1,0 +1,209 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>HR Entry</title>
+  <style>
+    :root {
+      --fg: #1f2328;
+      --muted: #656d76;
+      --border: #d0d7de;
+      --bg: #ffffff;
+      --accent: #0969da;
+      --ok: #1a7f37;
+      --warn: #9a6700;
+      --err: #cf222e;
+    }
+    * { box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      color: var(--fg);
+      background: var(--bg);
+      margin: 0;
+      padding: 40px 20px;
+      display: flex;
+      justify-content: center;
+    }
+    main {
+      width: 100%;
+      max-width: 520px;
+    }
+    h1 {
+      font-size: 20px;
+      margin: 0 0 24px;
+    }
+    .card {
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 20px;
+      margin-bottom: 16px;
+    }
+    .row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }
+    .user { font-weight: 500; }
+    .muted { color: var(--muted); font-size: 14px; }
+    a.btn, button {
+      display: inline-block;
+      font: inherit;
+      padding: 6px 14px;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+      background: #f6f8fa;
+      color: var(--fg);
+      text-decoration: none;
+      cursor: pointer;
+    }
+    a.btn.primary, button.primary {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: white;
+    }
+    button:disabled { opacity: 0.6; cursor: not-allowed; }
+    label { display: block; margin-bottom: 8px; font-size: 14px; }
+    input[type=file] {
+      width: 100%;
+      padding: 8px;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      margin-bottom: 12px;
+      background: #f6f8fa;
+    }
+    #status {
+      margin-top: 16px;
+      padding: 12px;
+      border-radius: 6px;
+      font-size: 14px;
+      display: none;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    #status.ok  { display: block; background: #dafbe1; color: var(--ok);  border: 1px solid #aceebb; }
+    #status.warn{ display: block; background: #fff8c5; color: var(--warn);border: 1px solid #eac54f; }
+    #status.err { display: block; background: #ffebe9; color: var(--err); border: 1px solid #ffcecb; }
+    .hidden { display: none; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>HR Entry</h1>
+
+    <div id="loading" class="card muted">Loading&hellip;</div>
+
+    <div id="anon" class="card hidden">
+      <div class="row">
+        <div>
+          <div class="user">Not signed in</div>
+          <div class="muted">Sign in with your Nexus account to upload documents.</div>
+        </div>
+        <a class="btn primary" href="/logto/sign-in">Sign in</a>
+      </div>
+    </div>
+
+    <div id="auth" class="card hidden">
+      <div class="row">
+        <div>
+          <div class="user" id="username"></div>
+          <div class="muted">Signed in</div>
+        </div>
+        <a class="btn" href="/logto/sign-out">Sign out</a>
+      </div>
+    </div>
+
+    <div id="upload" class="card hidden">
+      <form id="upload-form">
+        <label for="file">Upload a document</label>
+        <input id="file" name="file" type="file" required />
+        <button type="submit" class="primary" id="submit">Upload</button>
+      </form>
+      <div id="status"></div>
+    </div>
+  </main>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+
+    function show(id) { $(id).classList.remove('hidden'); }
+    function hide(id) { $(id).classList.add('hidden'); }
+
+    function setStatus(kind, message) {
+      const el = $('status');
+      el.className = kind;      // 'ok' | 'warn' | 'err' (or '' to hide)
+      el.textContent = message;
+    }
+
+    async function loadMe() {
+      try {
+        const res = await fetch('/me', { credentials: 'same-origin' });
+        const data = await res.json();
+        hide('loading');
+        if (data.authenticated) {
+          $('username').textContent = data.username || 'Signed in user';
+          show('auth');
+          show('upload');
+        } else {
+          show('anon');
+        }
+      } catch (err) {
+        hide('loading');
+        show('anon');
+        console.error('Failed to load /me', err);
+      }
+    }
+
+    async function handleUpload(e) {
+      e.preventDefault();
+      const fileInput = $('file');
+      const file = fileInput.files[0];
+      if (!file) return;
+
+      const submit = $('submit');
+      submit.disabled = true;
+      setStatus('', 'Uploading…');
+      $('status').className = '';
+      $('status').style.display = 'block';
+      $('status').textContent = 'Uploading…';
+
+      const form = new FormData();
+      form.append('file', file);
+
+      try {
+        const res = await fetch('/upload', {
+          method: 'POST',
+          credentials: 'same-origin',
+          body: form,
+        });
+
+        // Try to parse JSON; fall back to raw text for non-JSON errors.
+        let body;
+        const ct = res.headers.get('content-type') || '';
+        body = ct.includes('application/json') ? await res.json() : { detail: await res.text() };
+
+        if (res.ok) {
+          setStatus('ok', 'Upload succeeded.\n\n' + JSON.stringify(body, null, 2));
+          fileInput.value = '';
+        } else if (res.status === 401) {
+          setStatus('err', 'Your session expired. Please sign in again.');
+        } else if (res.status === 403) {
+          setStatus('err', 'You are not authorized to upload.');
+        } else if (res.status === 502) {
+          setStatus('warn', 'Auth succeeded, but the ingest pipeline is not reachable yet (502). This is expected until the n8n webhook is live.');
+        } else {
+          setStatus('err', 'Upload failed (' + res.status + ').\n' + (body.detail || body.error || JSON.stringify(body)));
+        }
+      } catch (err) {
+        setStatus('err', 'Network error: ' + err.message);
+      } finally {
+        submit.disabled = false;
+      }
+    }
+
+    $('upload-form').addEventListener('submit', handleUpload);
+    loadMe();
+  </script>
+</body>
+</html>

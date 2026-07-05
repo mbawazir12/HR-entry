@@ -2,6 +2,8 @@ import express from 'express';
 import session from 'express-session';
 import multer from 'multer';
 import { handleAuthRoutes, withLogto } from '@logto/express';
+import { createClient } from 'redis';
+import RedisStore from 'connect-redis';
 
 const {
   LOGTO_ENDPOINT,
@@ -12,6 +14,7 @@ const {
   N8N_WEBHOOK_URL,
   EDGE_SHARED_SECRET,
   NODE_ENV,
+  REDIS_URL,
   PORT = 3000,
 } = process.env;
 
@@ -25,11 +28,26 @@ const logtoConfig = {
 
 const app = express();
 
-// Render (and most hosts) sit behind a proxy; required for Secure cookies.
+// Vercel (and most hosts) sit behind a proxy; required for Secure cookies.
 app.set('trust proxy', 1);
+
+// Serverless functions are stateless — MemoryStore drops sessions between
+// invocations, which breaks Logto's sign-in callback. Use Redis when REDIS_URL
+// is present, and fall back to MemoryStore for local dev.
+let sessionStore;
+if (REDIS_URL) {
+  const redisClient = createClient({ url: REDIS_URL });
+  redisClient.on('error', (err) => console.error('Redis error:', err));
+  // Fire-and-forget; connect-redis queues commands until connected.
+  redisClient.connect().catch((err) => console.error('Redis connect failed:', err));
+  sessionStore = new RedisStore({ client: redisClient, prefix: 'hr:sess:' });
+} else {
+  console.warn('REDIS_URL not set — using in-memory session store (dev only).');
+}
 
 app.use(
   session({
+    store: sessionStore,
     secret: COOKIE_SECRET,
     resave: false,
     saveUninitialized: false,
@@ -109,6 +127,12 @@ app.post('/upload', withLogto(logtoConfig), requireAuth, upload.single('file'), 
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`Edge server on :${PORT}`);
-});
+// On Vercel the platform invokes the exported handler per request — do not
+// bind a port. Locally, run a regular HTTP server.
+if (!process.env.VERCEL) {
+  app.listen(PORT, () => {
+    console.log(`Edge server on :${PORT}`);
+  });
+}
+
+export default app;
