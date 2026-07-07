@@ -1,9 +1,11 @@
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import crypto from 'node:crypto';
 import express from 'express';
 import cookieSession from 'cookie-session';
 import multer from 'multer';
 import { handleAuthRoutes, withLogto } from '@logto/express';
+import { createClient } from '@supabase/supabase-js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -28,6 +30,8 @@ const {
   COOKIE_SECRET,
   N8N_WEBHOOK_URL,
   EDGE_SHARED_SECRET,
+  SUPABASE_URL,
+  SUPABASE_SERVICE_ROLE_KEY,
   NODE_ENV,
   PORT = 3000,
 } = process.env;
@@ -38,6 +42,29 @@ const logtoConfig = {
   appSecret: LOGTO_APP_SECRET,
   baseUrl: BASE_URL,
   fetchUserInfo: true,   // gives us the username from the userinfo endpoint
+};
+
+// Service-role client — bypasses RLS. All queries MUST be filtered by the
+// verified user_sub server-side; the deny-all RLS policy on the table is only
+// defense in depth for direct PostgREST access.
+const supabase = SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY
+  ? createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, { auth: { persistSession: false } })
+  : null;
+
+if (!supabase) {
+  console.warn('[boot] SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY missing — history logging disabled.');
+}
+
+// Best-effort insert. Never throws — a logging failure must not break the
+// user response for /upload.
+const recordHistory = async (row) => {
+  if (!supabase) return;
+  try {
+    const { error } = await supabase.from('upload_history').insert(row);
+    if (error) console.error('[history] insert failed:', error.message);
+  } catch (err) {
+    console.error('[history] insert threw:', err?.message || err);
+  }
 };
 
 const app = express();
@@ -75,30 +102,66 @@ const upload = multer({
 // The gate: any authenticated Logto user. Auth-only at this stage —
 // username/password login carries no email, so there's nothing to gate
 // HR on yet. The HR-specific check drops back in right here later.
+// Identity is read from ID-token claims only; req.user.userInfo is empty
+// in this setup and must not be used.
 const requireAuth = (req, res, next) => {
   if (!req.user?.isAuthenticated) {
     return res.status(401).json({ error: 'not_authenticated' });
   }
-  // Trusted identity from Logto, never from the browser.
-  req.uploader = req.user.userInfo?.username || req.user.claims?.sub;
+  const claims = req.user.claims || {};
+  req.userSub  = claims.sub || null;
+  req.userName = claims.name || null;
+  req.uploader = claims.username || claims.preferred_username || req.userSub;
   next();
 };
 
 // Lightweight status endpoint for the frontend to render login state.
 app.get('/me', withLogto(logtoConfig), (req, res) => {
   if (!req.user?.isAuthenticated) return res.json({ authenticated: false });
+  const claims = req.user.claims || {};
   res.json({
     authenticated: true,
-    username: req.user.userInfo?.username ?? req.user.claims?.sub ?? null,
+    username: claims.username ?? claims.preferred_username ?? claims.sub ?? null,
+    name: claims.name ?? null,
   });
 });
 
 // The protected upload. Auth chain runs BEFORE multer touches the file.
-app.post('/upload', withLogto(logtoConfig), requireAuth, upload.single('file'), async (req, res) => {
-  try {
-    if (!req.file) return res.status(400).json({ error: 'no_file' });
+// Multer errors (e.g. LIMIT_FILE_SIZE) are caught by the error middleware
+// registered below so we can record a history row before responding.
+app.post('/upload', withLogto(logtoConfig), requireAuth, (req, res, next) => {
+  upload.single('file')(req, res, (err) => {
+    if (err) return next(err);
+    handleUpload(req, res).catch(next);
+  });
+});
 
-    // ---- This is the contract n8n's webhook will consume in Phase 2 ----
+async function handleUpload(req, res) {
+  const baseRow = {
+    user_sub: req.userSub,
+    user_email: null,
+    uploader: req.uploader,
+    filename: req.file?.originalname ?? null,
+    content_type: req.file?.mimetype ?? null,
+    size_bytes: req.file?.size ?? null,
+    content_sha256: null,
+  };
+
+  if (!req.file) {
+    await recordHistory({
+      ...baseRow,
+      status: 'rejected',
+      http_status: 400,
+      error_message: 'no_file',
+    });
+    return res.status(400).json({ error: 'no_file' });
+  }
+
+  const sha256 = crypto.createHash('sha256').update(req.file.buffer).digest('hex');
+  baseRow.content_sha256 = sha256;
+
+  try {
+    // ---- This is the contract n8n's webhook consumes ----
     const form = new FormData();
     form.append(
       'file',
@@ -107,26 +170,26 @@ app.post('/upload', withLogto(logtoConfig), requireAuth, upload.single('file'), 
     );
     form.append('uploadedBy', req.uploader);
     form.append('uploadedAt', new Date().toISOString());
-    // --------------------------------------------------------------------
+    // -----------------------------------------------------
 
     // Logto's client stashed the ID token in the session at sign-in; forward
     // it so n8n can verify the user identity against Logto's JWKS instead of
     // trusting the uploadedBy string.
     const idToken = req.session?.idToken;
-    const claims = idToken ? decodeJwtPayload(idToken) : null;
+    const idClaims = idToken ? decodeJwtPayload(idToken) : null;
     console.log('[upload] forwarding to n8n', {
       hasIdToken: Boolean(idToken),
-      iss: claims?.iss,
-      aud: claims?.aud,
-      sub: claims?.sub,
-      exp: claims?.exp,
-      expiresInSec: claims?.exp ? claims.exp - Math.floor(Date.now() / 1000) : null,
+      iss: idClaims?.iss,
+      aud: idClaims?.aud,
+      sub: idClaims?.sub,
+      exp: idClaims?.exp,
+      expiresInSec: idClaims?.exp ? idClaims.exp - Math.floor(Date.now() / 1000) : null,
     });
 
     const r = await fetch(N8N_WEBHOOK_URL, {
       method: 'POST',
       headers: {
-        'x-edge-secret': EDGE_SHARED_SECRET, // proves the call came from us
+        'x-edge-secret': EDGE_SHARED_SECRET,
         ...(idToken && { Authorization: `Bearer ${idToken}` }),
       },
       body: form,
@@ -135,6 +198,14 @@ app.post('/upload', withLogto(logtoConfig), requireAuth, upload.single('file'), 
     if (!r.ok) {
       const detail = await r.text();
       console.error('[upload] n8n rejected:', r.status, detail);
+      // 415 = unsupported type → rejected (amber). Other non-2xx → error (red).
+      const status = r.status === 415 ? 'rejected' : 'error';
+      await recordHistory({
+        ...baseRow,
+        status,
+        http_status: r.status,
+        error_message: detail,
+      });
       return res.status(502).json({
         error: 'ingest_failed',
         upstreamStatus: r.status,
@@ -143,11 +214,95 @@ app.post('/upload', withLogto(logtoConfig), requireAuth, upload.single('file'), 
     }
 
     const data = await r.json().catch(() => ({}));
+    await recordHistory({
+      ...baseRow,
+      status: 'success',
+      http_status: r.status,
+      ingest_response: data,
+    });
     res.json({ ok: true, ingest: data });
   } catch (err) {
     console.error(err);
+    await recordHistory({
+      ...baseRow,
+      status: 'error',
+      http_status: 502,
+      error_message: err?.message || 'transport_error',
+    });
     res.status(500).json({ error: 'server_error' });
   }
+}
+
+// /upload-scoped error handler for multer size/type rejections. Records the
+// outcome to history before responding so the user sees the row.
+app.use('/upload', async (err, req, res, next) => {
+  if (!(err instanceof multer.MulterError)) return next(err);
+  const row = {
+    user_sub: req.userSub ?? null,
+    user_email: null,
+    uploader: req.uploader ?? null,
+    filename: req.file?.originalname ?? null,
+    content_type: req.file?.mimetype ?? null,
+    size_bytes: req.file?.size ?? null,
+    content_sha256: null,
+    status: 'rejected',
+    http_status: err.code === 'LIMIT_FILE_SIZE' ? 413 : 400,
+    error_message: err.code || err.message,
+  };
+  await recordHistory(row);
+  const status = err.code === 'LIMIT_FILE_SIZE' ? 413 : 400;
+  const errorName = err.code === 'LIMIT_FILE_SIZE' ? 'file_too_large' : 'upload_error';
+  res.status(status).json({ error: errorName, detail: err.message });
+});
+
+// GET /history — newest first, filtered by verified user_sub.
+app.get('/history', withLogto(logtoConfig), requireAuth, async (req, res) => {
+  if (!supabase) return res.status(503).json({ error: 'history_unavailable' });
+  const { data, error } = await supabase
+    .from('upload_history')
+    .select('id, filename, content_type, size_bytes, status, http_status, error_message, created_at')
+    .eq('user_sub', req.userSub)
+    .order('created_at', { ascending: false })
+    .limit(200);
+  if (error) {
+    console.error('[history] read failed:', error.message);
+    return res.status(500).json({ error: 'history_read_failed' });
+  }
+  res.json({ items: data });
+});
+
+// DELETE /history — clear the current user's rows.
+app.delete('/history', withLogto(logtoConfig), requireAuth, async (req, res) => {
+  if (!supabase) return res.status(503).json({ error: 'history_unavailable' });
+  const { error } = await supabase
+    .from('upload_history')
+    .delete()
+    .eq('user_sub', req.userSub);
+  if (error) {
+    console.error('[history] delete failed:', error.message);
+    return res.status(500).json({ error: 'history_delete_failed' });
+  }
+  res.json({ ok: true });
+});
+
+// GET /health — cheap probe for the sidebar connection dot. Probes n8n with
+// HEAD (any response, even 4xx, means the webhook host is up). Never triggers
+// an ingest.
+app.get('/health', async (_req, res) => {
+  let n8nReachable = null;
+  if (N8N_WEBHOOK_URL) {
+    const ac = new AbortController();
+    const t = setTimeout(() => ac.abort(), 3000);
+    try {
+      const r = await fetch(N8N_WEBHOOK_URL, { method: 'HEAD', signal: ac.signal });
+      n8nReachable = r.status < 500;
+    } catch {
+      n8nReachable = false;
+    } finally {
+      clearTimeout(t);
+    }
+  }
+  res.json({ ok: true, n8n: n8nReachable });
 });
 
 // On Vercel the platform invokes the exported handler per request — do not
