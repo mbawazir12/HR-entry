@@ -160,6 +160,40 @@ async function handleUpload(req, res) {
   const sha256 = crypto.createHash('sha256').update(req.file.buffer).digest('hex');
   baseRow.content_sha256 = sha256;
 
+  // De-dup guard: if this user has previously *successfully* ingested a file
+  // with identical bytes, bail with 409 unless the client explicitly overrode.
+  // Lookup is O(log n) via the (user_sub, content_sha256) composite index.
+  const allowDuplicate = String(req.body?.allowDuplicate || '') === 'true';
+  if (!allowDuplicate && supabase) {
+    try {
+      const { data: existing } = await supabase
+        .from('upload_history')
+        .select('filename, created_at')
+        .eq('user_sub', req.userSub)
+        .eq('content_sha256', sha256)
+        .eq('status', 'success')
+        .order('created_at', { ascending: false })
+        .limit(1);
+      if (existing && existing.length > 0) {
+        const prev = existing[0];
+        await recordHistory({
+          ...baseRow,
+          status: 'rejected',
+          http_status: 409,
+          error_message: 'duplicate_content',
+        });
+        return res.status(409).json({
+          error: 'duplicate_content',
+          previousUpload: { filename: prev.filename, created_at: prev.created_at },
+        });
+      }
+    } catch (err) {
+      // If the dup lookup blows up, don't block the user — fall through to
+      // the normal upload path. A miss just means no de-dup on this request.
+      console.error('[upload] dup-check failed:', err?.message || err);
+    }
+  }
+
   try {
     // ---- This is the contract n8n's webhook consumes ----
     const form = new FormData();

@@ -509,13 +509,14 @@
 
     submit.addEventListener('click', () => uploadFile(selectedFile));
 
-    async function uploadFile(file) {
+    async function uploadFile(file, allowDuplicate = false) {
       if (!file) return;
       submit.disabled = true;
       setStatus('', 'Uploading…');
 
       const form = new FormData();
       form.append('file', file);
+      if (allowDuplicate) form.append('allowDuplicate', 'true');
       try {
         const res = await fetch('/upload', {
           method: 'POST',
@@ -533,6 +534,22 @@
           setStatus('err', 'Your session expired. Please sign in again.');
         } else if (res.status === 403) {
           setStatus('err', 'You are not authorized to upload.');
+        } else if (res.status === 409 && body.error === 'duplicate_content') {
+          // Duplicate detected server-side. Prompt to override; on confirm,
+          // resubmit with allowDuplicate=true.
+          const prev = body.previousUpload || {};
+          const name = prev.filename ? `"${prev.filename}"` : 'this file';
+          const when = prev.created_at ? relativeTime(prev.created_at) : 'previously';
+          const proceed = confirm(
+            `You already uploaded ${name} ${when} with identical contents.\n\nUpload anyway?`
+          );
+          if (proceed) {
+            // Reload history so the user sees the 'rejected: duplicate_content'
+            // row, then resubmit with the override.
+            loadHistory();
+            return uploadFile(file, true);
+          }
+          setStatus('warn', 'Upload cancelled — matches a previous successful upload.');
         } else if (res.status === 413) {
           setStatus('warn', 'Rejected: file too large (max 20 MB).');
         } else if (res.status === 502) {
